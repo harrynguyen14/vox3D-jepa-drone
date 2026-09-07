@@ -140,7 +140,18 @@ class SparseVoxelEncoder(nn.Module):
         # a fully-masked row (sample with zero patches) makes attention ill-defined
         pad_mask[counts_per_sample == 0, 0] = False
 
-        encoded = self.transformer(padded, src_key_padding_mask=pad_mask)  # (B, max_tokens, embed_dim)
+        # Run the Transformer in fp32 even under an outer AMP autocast.
+        # nn.TransformerEncoderLayer's softmax over src_key_padding_mask
+        # is a known source of NaN under fp16: samples with very few real
+        # tokens (heavily padded rows — expected here, since per-frame
+        # voxel/patch counts vary a lot, ~5K-18K voxels/frame) can hit
+        # attention rows where every unmasked score underflows fp16's
+        # range, producing NaN softmax output. fp32 has enough headroom
+        # to avoid this; the rest of the model (MLPs, linear layers)
+        # keeps running under autocast as usual.
+        with torch.autocast(device_type=padded.device.type, enabled=False):
+            encoded = self.transformer(padded.float(), src_key_padding_mask=pad_mask)  # (B, max_tokens, embed_dim)
+        encoded = encoded.to(tokens.dtype)
         valid = (~pad_mask).unsqueeze(-1).to(encoded.dtype)
         pooled = (encoded * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)
         return self.norm(pooled)
