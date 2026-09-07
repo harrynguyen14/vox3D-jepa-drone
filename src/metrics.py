@@ -39,10 +39,17 @@ def embedding_std(z: torch.Tensor) -> float:
 @torch.no_grad()
 def effective_rank(z: torch.Tensor, eps: float = 1e-12) -> float:
     """RankMe: exp(entropy of normalized singular values). z: (B, D)."""
-    if z.shape[0] < 2:
+    if z.shape[0] < 2 or not torch.isfinite(z).all():
+        # a non-finite z (e.g. after an AMP overflow upstream) makes SVD
+        # fail to converge and print a noisy warning without adding
+        # information — the caller already has embedding_std/loss to see
+        # that something's wrong, so just report it as such here.
         return float("nan")
     z = z.float() - z.float().mean(dim=0, keepdim=True)
-    singular_values = torch.linalg.svdvals(z)
+    try:
+        singular_values = torch.linalg.svdvals(z)
+    except torch.linalg.LinAlgError:
+        return float("nan")
     p = singular_values / (singular_values.sum() + eps)
     p = p.clamp(min=eps)
     entropy = -(p * p.log()).sum()

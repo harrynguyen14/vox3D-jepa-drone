@@ -156,6 +156,15 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
                 out = model(batch)
                 loss = out["loss"]
 
+            if not torch.isfinite(loss):
+                # loss went NaN/Inf (e.g. AMP fp16 overflow) — GradScaler
+                # only catches Inf/NaN *gradients*, not a bad loss going
+                # into backward, so this has to be checked explicitly.
+                # Skip the step instead of poisoning the model permanently.
+                if is_main:
+                    tqdm.write(f"[epoch {epoch} step {step}] non-finite loss ({loss.item()}), skipping batch")
+                continue
+
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -164,11 +173,18 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
             step += 1
             if is_main and step % args.log_every == 0:
                 z_t = out["z_t"].detach()
+                # tqdm sorts kwargs alphabetically and truncates long lines,
+                # which silently dropped "std" off the end on narrow
+                # terminals — pass an already-ordered dict instead, which
+                # tqdm keeps in insertion order (std first: the most
+                # reliable collapse signal, see idea.md section 9f)
                 pbar.set_postfix(
-                    loss=loss.item(),
-                    std=embedding_std(z_t),
-                    rank=effective_rank(z_t),
-                    sep=scenario_separation(z_t, batch["scenarios"]),
+                    {
+                        "loss": loss.item(),
+                        "std": embedding_std(z_t),
+                        "rank": effective_rank(z_t),
+                        "sep": scenario_separation(z_t, batch["scenarios"]),
+                    }
                 )
 
         if is_main and (epoch + 1) % args.save_every_epoch == 0:
