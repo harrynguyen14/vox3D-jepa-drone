@@ -144,6 +144,7 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         patch_size=args.patch_size,
         grid_size=grid_size,
         ema_momentum=args.ema_momentum,
+        ema_momentum_final=args.ema_momentum_final,
     ).to(device)
 
     # DDP wraps context_encoder + predictor (the params that receive
@@ -197,9 +198,18 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
             if batch["coords_t"].shape[0] == 0 or batch["coords_t1"].shape[0] == 0:
                 continue
 
+            progress = min(step / max(1, total_steps), 1.0)
+            # weight decay ramps start->final alongside training progress,
+            # same linear-schedule pattern as EMA momentum (I-JEPA/V-JEPA
+            # use e.g. 0.04->0.4): light regularization while the encoder is
+            # still learning basic structure, heavier once it has.
+            wd = args.weight_decay + (args.weight_decay_final - args.weight_decay) * progress
+            for group in optimizer.param_groups:
+                group["weight_decay"] = wd
+
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device.type, enabled=use_amp):
-                out = model(batch)
+                out = model(batch, vicreg_weight=args.vicreg_weight)
                 loss = out["loss"]
 
             if not torch.isfinite(loss):
@@ -262,7 +272,7 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
-            model.update_target_encoder()
+            model.update_target_encoder(progress=progress)
 
             step += 1
             if is_main and step % args.log_every == 0:
