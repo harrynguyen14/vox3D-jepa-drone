@@ -125,7 +125,23 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     is_main = rank == 0
-    use_amp = args.amp and device.type == "cuda"
+    # bf16 has fp32's exponent range (8 bits) with less mantissa precision,
+    # so it doesn't hit the overflow-to-NaN failure mode fp16's narrow
+    # ~6e-5..65504 range does (see train_jepa.py module docstring) — use it
+    # whenever the GPU's tensor cores support it (Ampere+: A100/L4/RTX
+    # 30xx+). Kaggle's T4/P100 don't support bf16 tensor cores, and fp16
+    # is exactly the overflow-prone dtype this project moved away from, so
+    # autocast is skipped entirely there — plain fp32, slower but with no
+    # overflow risk at all. GradScaler exists to counter fp16's gradient
+    # *underflow* (opposite problem, same root cause: narrow range); it's
+    # only ever needed in the fp16 branch, which this never takes.
+    bf16_available = device.type == "cuda" and torch.cuda.is_bf16_supported()
+    use_amp = args.amp and bf16_available
+    amp_dtype = torch.bfloat16
+    use_grad_scaler = False
+    if is_main:
+        print(f"[precision] {'bf16 autocast' if use_amp else 'fp32'} "
+              f"(bf16_available={bf16_available}, --amp={args.amp})")
 
     # seed before model creation so weight init is identical across DDP
     # ranks (required — DDP assumes replicas start in sync), then re-seed
@@ -174,7 +190,7 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         weight_decay=args.weight_decay,
     )
     optimizer.add_param_group({"params": model.predictor.parameters()})
-    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
+    scaler = torch.amp.GradScaler(device.type, enabled=use_grad_scaler)
 
     total_steps = args.epochs * len(dataloader)
     lr_schedule = warmup_cosine_schedule(args.warmup_steps, total_steps, args.min_lr_ratio)
@@ -208,7 +224,7 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
                 group["weight_decay"] = wd
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device.type, enabled=use_amp):
+            with torch.amp.autocast(device.type, enabled=use_amp, dtype=amp_dtype):
                 out = model(batch, vicreg_weight=args.vicreg_weight)
                 loss = out["loss"]
 

@@ -45,6 +45,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints/jepa_stage1")
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--save-every-epoch", type=int, default=5)
+    # fp16's ~6e-5..65504 dynamic range was the real source of this
+    # project's NaN issues (raw occupancy-count features, 6-layer Pre-LN
+    # attention scores, and JEPA's own normalize()/backward all have
+    # separate ways to overflow it, so patching each one individually never
+    # fully closed the class of bug). train_jepa.py now uses bf16 instead —
+    # fp32's exponent range so no overflow risk, but only on GPUs with
+    # bf16 tensor cores (Ampere+: A100/L4/RTX 30xx+); it auto-falls back to
+    # plain fp32 on GPUs without it (e.g. Kaggle's T4/P100), never fp16.
+    # So this is safe on by default; pass --no-amp to force fp32 everywhere.
     parser.add_argument("--amp", action="store_true", default=True)
     parser.add_argument("--no-amp", dest="amp", action="store_false")
     parser.add_argument("--grad-clip-norm", type=float, default=1.0, help="0 disables clipping")

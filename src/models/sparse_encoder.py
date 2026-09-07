@@ -97,6 +97,17 @@ class SparseVoxelEncoder(nn.Module):
         if coords.shape[0] == 0:
             return torch.zeros(batch_size, self.embed_dim, device=feats.device)
 
+        # feats is a raw per-voxel occupancy COUNT (see voxelize.py), an
+        # unbounded value (dense LiDAR returns can put dozens-hundreds of
+        # points in one voxel) fed straight into a plain nn.Linear with no
+        # normalization ahead of it. Under AMP autocast this Linear runs in
+        # fp16 (max ~65504) — a raw count large enough, or one amplified a
+        # few layers deep through attention, overflows to Inf and produces
+        # the NaN gradients seen in training. log1p compresses the
+        # unbounded count into a small, stable range (0 points -> 0, 100
+        # points -> ~4.6) without needing a dataset-wide statistic.
+        feats = torch.log1p(feats)
+
         raw_patch_id = _patch_id(coords, self.grid_size, self.patch_size)
         unique_ids, patch_idx = torch.unique(raw_patch_id, return_inverse=True)
         n_patches = unique_ids.shape[0]
