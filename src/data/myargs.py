@@ -33,7 +33,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ema-momentum", type=float, default=0.996)
 
     # train
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=min(8, os.cpu_count() or 4))
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=3.0e-4)

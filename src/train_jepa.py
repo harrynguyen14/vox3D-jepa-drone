@@ -244,6 +244,12 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
                     # trusting scaler.step() to catch it after clipping.
                     if is_main:
                         tqdm.write(f"[epoch {epoch} step {step}] non-finite grad norm ({grad_norm.item()}), skipping batch")
+                    # scaler.update() must run every step (even a skipped
+                    # one) to reset the "already unscaled" internal flag —
+                    # otherwise the next iteration's unscale_() raises
+                    # "unscale_() has already been called... since the
+                    # last update()".
+                    scaler.update()
                     optimizer.zero_grad(set_to_none=True)
                     nan_streak += 1
                     if nan_streak >= args.nan_streak_limit:
