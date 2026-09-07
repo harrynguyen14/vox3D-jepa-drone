@@ -4,6 +4,7 @@ Single source of truth for data/model/train config — replaces
 configs/jepa_stage1.yaml. Call parse_args() from a script's __main__.
 """
 import argparse
+import os
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -33,7 +34,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # train
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=min(8, os.cpu_count() or 4))
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=3.0e-4)
     parser.add_argument("--weight-decay", type=float, default=1.0e-4)

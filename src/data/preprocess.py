@@ -1,7 +1,15 @@
 """One-time preprocessing: extract every /pointcloud frame from each ETH
-.bag file into its own .npy file, so training doesn't re-scan the bag from
-the start for every __getitem__ call (that was O(N^2) per epoch and doesn't
-parallelize safely across DataLoader workers).
+.bag file, voxelize it, and save the resulting (coords, feats) to disk.
+
+Doing this once here (instead of in Dataset.__getitem__) matters for two
+reasons:
+1. Reading directly from .bag per __getitem__ call re-scans the bag from
+   the start each time (O(N^2) per epoch) and doesn't parallelize safely
+   across DataLoader workers.
+2. Voxelizing a ~100K-point raw cloud with np.unique is CPU-heavy. Doing
+   it once here instead of every epoch removes it from the training hot
+   path entirely — training was observed CPU-bound (373% CPU, ~0% GPU on
+   a Kaggle 2xT4 session) with voxelization left inside __getitem__.
 
 Run once per machine before training:
 
@@ -15,6 +23,7 @@ from rosbags.highlevel import AnyReader
 from tqdm import tqdm
 
 from src.data.myargs import POINTCLOUD_TOPIC
+from src.data.voxelize import VoxelConfig, points_to_sparse_voxels
 
 
 def _read_pointcloud_xyz(msg) -> np.ndarray:
@@ -35,7 +44,7 @@ def _read_pointcloud_xyz(msg) -> np.ndarray:
     return xyz[np.isfinite(xyz).all(axis=1)]
 
 
-def extract_bag(bag_path: Path, out_dir: Path) -> int:
+def extract_bag(bag_path: Path, out_dir: Path, voxel_cfg: VoxelConfig) -> int:
     scenario_dir = out_dir / bag_path.stem
     scenario_dir.mkdir(parents=True, exist_ok=True)
 
@@ -47,7 +56,8 @@ def extract_bag(bag_path: Path, out_dir: Path) -> int:
         ):
             msg = reader.deserialize(rawdata, connection.msgtype)
             xyz = _read_pointcloud_xyz(msg)
-            np.save(scenario_dir / f"{i:06d}.npy", xyz)
+            coords, feats = points_to_sparse_voxels(xyz, voxel_cfg)
+            np.savez(scenario_dir / f"{i:06d}.npz", coords=coords, feats=feats)
             n_frames += 1
     return n_frames
 
@@ -62,7 +72,18 @@ def main() -> None:
         nargs="+",
         default=["corridor_1", "corridor_2", "hg_1", "hg_2", "indoor", "ramp_1", "ramp_2", "stairs"],
     )
+    parser.add_argument("--voxel-size", type=float, default=0.15)
+    parser.add_argument("--x-range", type=float, nargs=2, default=[-8.0, 8.0])
+    parser.add_argument("--y-range", type=float, nargs=2, default=[-8.0, 8.0])
+    parser.add_argument("--z-range", type=float, nargs=2, default=[-4.0, 4.0])
     args = parser.parse_args()
+
+    voxel_cfg = VoxelConfig(
+        voxel_size=args.voxel_size,
+        x_range=tuple(args.x_range),
+        y_range=tuple(args.y_range),
+        z_range=tuple(args.z_range),
+    )
 
     dataset_dir = Path(args.dataset_dir)
     out_dir = Path(args.out_dir)
@@ -73,7 +94,7 @@ def main() -> None:
         if not bag_path.exists():
             print(f"skip {bag_path} (not found)")
             continue
-        n = extract_bag(bag_path, out_dir)
+        n = extract_bag(bag_path, out_dir, voxel_cfg)
         print(f"{name}: {n} frames -> {out_dir / name}")
 
 
