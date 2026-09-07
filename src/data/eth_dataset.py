@@ -62,6 +62,7 @@ class ETHPointCloudPairDataset(Dataset):
             "feats_t": torch.from_numpy(feats_t),
             "coords_t1": torch.from_numpy(coords_t1),
             "feats_t1": torch.from_numpy(feats_t1),
+            "scenario": pair.scenario_dir.name,
         }
 
 
@@ -92,4 +93,5 @@ def sparse_collate(batch: list[dict]) -> dict:
         "coords_t1": coords_t1,
         "feats_t1": feats_t1,
         "batch_size": len(batch),
+        "scenarios": [sample["scenario"] for sample in batch],
     }

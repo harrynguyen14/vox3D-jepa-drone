@@ -32,6 +32,7 @@ from tqdm import tqdm
 from src.data.eth_dataset import ETHPointCloudPairDataset, sparse_collate
 from src.data.myargs import parse_args
 from src.data.voxelize import VoxelConfig
+from src.metrics import effective_rank, embedding_std, scenario_separation
 from src.models.jepa import VoxelJEPA
 
 
@@ -162,7 +163,13 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
 
             step += 1
             if is_main and step % args.log_every == 0:
-                pbar.set_postfix(loss=loss.item())
+                z_t = out["z_t"].detach()
+                pbar.set_postfix(
+                    loss=loss.item(),
+                    std=embedding_std(z_t),
+                    rank=effective_rank(z_t),
+                    sep=scenario_separation(z_t, batch["scenarios"]),
+                )
 
         if is_main and (epoch + 1) % args.save_every_epoch == 0:
             save_checkpoint(ckpt_dir / f"voxel_jepa_epoch{epoch+1}.pt")
