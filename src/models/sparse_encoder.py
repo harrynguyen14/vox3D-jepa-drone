@@ -140,25 +140,19 @@ class SparseVoxelEncoder(nn.Module):
         # a fully-masked row (sample with zero patches) makes attention ill-defined
         pad_mask[counts_per_sample == 0, 0] = False
 
-        # Run the Transformer in fp32 even under an outer AMP autocast, and
-        # scrub NaN from its output before pooling. Two independent, known
-        # PyTorch issues can make nn.TransformerEncoderLayer emit NaN for
-        # PADDING rows specifically (real-token rows are unaffected):
-        #   1. softmax(-inf, -inf, ..., -inf) = 0/0 = NaN. PyTorch's bool
-        #      src_key_padding_mask is internally converted to -inf, and a
-        #      row that ends up fully masked (or numerically close to it)
-        #      produces NaN — this is independent of fp16/fp32
-        #      (github.com/pytorch/pytorch/issues/64525, /issues/24816).
-        #   2. fp16 attention scores can additionally underflow on heavily
-        #      padded rows (this dataset's frames vary widely, ~5K-18K
-        #      voxels/frame, so padding ratio varies a lot per batch).
+        # nn.TransformerEncoderLayer can emit NaN for PADDING rows
+        # specifically (real-token rows are unaffected): its bool
+        # src_key_padding_mask is converted to -inf internally, and
+        # softmax(-inf, ..., -inf) = 0/0 = NaN — a PyTorch issue that's
+        # independent of fp16/fp32 (github.com/pytorch/pytorch/issues/64525,
+        # /issues/24816), so there's no AMP-precision fix for it; running
+        # this in fp32 only would have cost the fp16 speedup for no benefit.
         # Padding rows are never read past this point anyway (masked out by
         # `valid` below), so replacing their NaN with 0 is exact, not an
         # approximation — this is the documented community workaround, see
         # idea.md section 9i for the issue threads.
-        with torch.autocast(device_type=padded.device.type, enabled=False):
-            encoded = self.transformer(padded.float(), src_key_padding_mask=pad_mask)  # (B, max_tokens, embed_dim)
-        encoded = torch.nan_to_num(encoded, nan=0.0, posinf=0.0, neginf=0.0).to(tokens.dtype)
+        encoded = self.transformer(padded, src_key_padding_mask=pad_mask)  # (B, max_tokens, embed_dim)
+        encoded = torch.nan_to_num(encoded, nan=0.0, posinf=0.0, neginf=0.0)
         valid = (~pad_mask).unsqueeze(-1).to(encoded.dtype)
         pooled = (encoded * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)
         return self.norm(pooled)
