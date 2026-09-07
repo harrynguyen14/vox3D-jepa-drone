@@ -1,0 +1,4 @@
+torch>=2.1
+rosbags>=0.11
+numpy
+tqdm

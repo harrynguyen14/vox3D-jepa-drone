@@ -1,0 +1,12 @@
+idea.md
+
+__pycache__/
+*.pyc
+
+checkpoints/
+*.pt
+
+# preprocessed/raw data, not source
+npy_cache/
+*.bag
+*.npy
