@@ -44,6 +44,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--save-every-epoch", type=int, default=5)
     parser.add_argument("--amp", action="store_true", default=True)
     parser.add_argument("--no-amp", dest="amp", action="store_false")
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0, help="0 disables clipping")
+    parser.add_argument("--warmup-steps", type=int, default=500)
+    parser.add_argument("--min-lr-ratio", type=float, default=0.01, help="cosine decay floor, as a fraction of --lr")
+    parser.add_argument(
+        "--nan-streak-limit",
+        type=int,
+        default=20,
+        help="stop training after this many consecutive non-finite losses (model weights are likely NaN)",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="for reproducibility, e.g. to re-debug a NaN run")
 
     return parser.parse_args(argv)
 

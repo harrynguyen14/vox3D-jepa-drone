@@ -17,11 +17,23 @@ Speed notes (see idea.md section 9d/9e for sources):
   a DistributedSampler shard of the dataset; gradients are all-reduced
   automatically. Falls back to single-GPU/CPU when only one device (or
   none) is visible, so this still runs unmodified on this dev machine.
+
+Stability notes (see idea.md section 9g/9h): a NaN loss was observed after
+6 stable epochs on Kaggle, likely AMP fp16 overflow. Beyond the isfinite
+guard (section 9g), this adds:
+- Gradient clipping (--grad-clip-norm, default 1.0): unscales AMP
+  gradients before clipping, since the clip threshold is meaningless
+  against the loss-scale factor otherwise.
+- LR schedule: linear warmup (--warmup-steps) then cosine decay to
+  --min-lr-ratio * --lr — a large initial LR hitting an under-warmed
+  Transformer is a common source of early-training blowups.
 """
 import argparse
 import os
+import random
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -34,6 +46,28 @@ from src.data.myargs import parse_args
 from src.data.voxelize import VoxelConfig
 from src.metrics import effective_rank, embedding_std, scenario_separation
 from src.models.jepa import VoxelJEPA
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def warmup_cosine_schedule(warmup_steps: int, total_steps: int, min_lr_ratio: float):
+    """LR multiplier: linear warmup to 1.0, then cosine decay to min_lr_ratio."""
+    import math
+
+    def fn(step: int) -> float:
+        if warmup_steps > 0 and step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        progress = min(progress, 1.0)
+        cosine = 0.5 * (1 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1 - min_lr_ratio) * cosine
+
+    return fn
 
 
 def build_dataset(args: argparse.Namespace) -> tuple[ETHPointCloudPairDataset, tuple[int, int, int]]:
@@ -93,6 +127,12 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
     is_main = rank == 0
     use_amp = args.amp and device.type == "cuda"
 
+    # seed before model creation so weight init is identical across DDP
+    # ranks (required — DDP assumes replicas start in sync), then re-seed
+    # per-rank afterwards so things like dataloader worker shuffling don't
+    # coincidentally line up across ranks
+    set_seed(args.seed)
+
     dataset, grid_size = build_dataset(args)
     dataloader, sampler = build_dataloader(dataset, args, rank if is_distributed else None, world_size)
 
@@ -113,6 +153,7 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
     if is_distributed:
         model.context_encoder = DDP(model.context_encoder, device_ids=[rank])
         model.predictor = DDP(model.predictor, device_ids=[rank])
+        set_seed(args.seed + rank)
 
     def save_checkpoint(path: Path) -> None:
         # unwrap DDP so the saved state_dict matches plain VoxelJEPA (no
@@ -134,11 +175,16 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
     optimizer.add_param_group({"params": model.predictor.parameters()})
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
+    total_steps = args.epochs * len(dataloader)
+    lr_schedule = warmup_cosine_schedule(args.warmup_steps, total_steps, args.min_lr_ratio)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule)
+
     ckpt_dir = Path(args.checkpoint_dir)
     if is_main:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     step = 0
+    nan_streak = 0
     for epoch in range(args.epochs):
         if sampler is not None:
             sampler.set_epoch(epoch)
@@ -163,11 +209,53 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
                 # Skip the step instead of poisoning the model permanently.
                 if is_main:
                     tqdm.write(f"[epoch {epoch} step {step}] non-finite loss ({loss.item()}), skipping batch")
+                nan_streak += 1
+                if nan_streak >= args.nan_streak_limit:
+                    # this many *consecutive* skips means the model's own
+                    # weights are already NaN (every batch now produces NaN
+                    # regardless of input) — a single bad batch, in
+                    # contrast, recovers on the next one. Continuing wastes
+                    # GPU time producing nothing but more skipped batches.
+                    if is_main:
+                        tqdm.write(
+                            f"[epoch {epoch} step {step}] {nan_streak} consecutive non-finite losses — "
+                            f"model weights are almost certainly NaN, stopping. "
+                            f"Re-run from the last good checkpoint with a lower --lr or smaller --grad-clip-norm."
+                        )
+                    if is_distributed:
+                        dist.destroy_process_group()
+                    return
                 continue
+            nan_streak = 0
 
             scaler.scale(loss).backward()
+            all_params = list(model.context_encoder.parameters()) + list(model.predictor.parameters())
+            if args.grad_clip_norm > 0:
+                # gradients must be unscaled before clipping, or the clip
+                # threshold is meaningless against the AMP loss-scale factor
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=args.grad_clip_norm)
+                if not torch.isfinite(grad_norm):
+                    # An Inf gradient divided by clip_grad_norm_'s Inf-valued
+                    # total_norm can come out as a finite-looking NaN/0, which
+                    # then hides the overflow from GradScaler's own Inf check
+                    # inside scaler.step() — so it applies a poisoned update
+                    # instead of skipping it. Skip explicitly here instead of
+                    # trusting scaler.step() to catch it after clipping.
+                    if is_main:
+                        tqdm.write(f"[epoch {epoch} step {step}] non-finite grad norm ({grad_norm.item()}), skipping batch")
+                    optimizer.zero_grad(set_to_none=True)
+                    nan_streak += 1
+                    if nan_streak >= args.nan_streak_limit:
+                        if is_main:
+                            tqdm.write(f"[epoch {epoch} step {step}] {nan_streak} consecutive non-finite grads, stopping.")
+                        if is_distributed:
+                            dist.destroy_process_group()
+                        return
+                    continue
             scaler.step(optimizer)
             scaler.update()
+            scheduler.step()
             model.update_target_encoder()
 
             step += 1
@@ -184,6 +272,7 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
                         "std": embedding_std(z_t),
                         "rank": effective_rank(z_t),
                         "sep": scenario_separation(z_t, batch["scenarios"]),
+                        "lr": scheduler.get_last_lr()[0],
                     }
                 )
 
